@@ -58,6 +58,7 @@ export type AgentResponse = {
   recommendations: Recommendation[];
   response: string;
   mode: string;
+  ai_warning?: string;
 };
 
 export type CompareResponse = {

@@ -1,17 +1,36 @@
-import json
 import logging
 import re
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Literal
 
 import httpx
+import httpx2
 from fastapi import HTTPException
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Cart, CartItem, Order, OrderItem, Product
 
 logger = logging.getLogger(__name__)
+ProductCategory = Literal[
+    "Laptops", "Smartphones", "Headphones", "Keyboards", "Monitors", "Accessories",
+]
+
+
+class ShoppingRequirements(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: ProductCategory | None = None
+    max_budget_inr: float | None = Field(default=None, gt=0, le=10_000_000, allow_inf_nan=False)
+    minimum_ram_gb: int | None = Field(default=None, ge=1, le=512)
+    keywords: list[str] = Field(default_factory=list, max_length=12)
+
+
 CATEGORY_ALIASES = {
     "laptop": "Laptops", "notebook": "Laptops", "computer": "Laptops",
     "phone": "Smartphones", "smartphone": "Smartphones",
@@ -34,12 +53,19 @@ def product_dict(product: Product) -> dict:
 
 
 def parse_budget(message: str) -> float | None:
-    candidates = re.findall(r"(?:₹|rs\.?\s*|inr\s*)\s?([\d,]+(?:\.\d+)?)", message, re.I)
-    if not candidates:
-        candidates = re.findall(r"([\d,]+(?:\.\d+)?)\s*(?:k|thousand)\b", message, re.I)
-        return float(candidates[0].replace(",", "")) * 1000 if candidates else None
-    amounts = [float(value.replace(",", "")) for value in candidates]
-    return amounts[-1] if amounts else None
+    candidates = re.findall(
+        r"(?:₹|rs\.?\s*|inr\s*)\s*([\d,]+(?:\.\d+)?)\s*(k|thousand)?\b",
+        message,
+        re.I,
+    )
+    if candidates:
+        amount, suffix = candidates[-1]
+        return float(amount.replace(",", "")) * (1000 if suffix else 1)
+    candidates = re.findall(r"([\d,]+(?:\.\d+)?)\s*(k|thousand)\b", message, re.I)
+    if candidates:
+        amount, _ = candidates[-1]
+        return float(amount.replace(",", "")) * 1000
+    return None
 
 
 def extract_category(message: str) -> str | None:
@@ -52,58 +78,63 @@ def extract_category(message: str) -> str | None:
     return max(matches, default=(0, None))[1]
 
 
-def extract_with_ai(message: str) -> dict | None:
-    provider = settings.ai_provider.lower()
-    if not settings.ai_api_key or provider not in {"openai", "gemini"}:
-        return None
+def extract_with_ai(message: str) -> tuple[dict | None, str | None]:
+    provider = settings.ai_provider.strip().lower()
+    if not provider:
+        return None, None
+    if provider != "gemini":
+        return None, "Unsupported AI provider. Set AI_PROVIDER=gemini or leave it blank; using catalogue-based recommendations."
+    if not settings.ai_api_key.strip():
+        logger.warning("Gemini is enabled without an API key; using deterministic catalogue fallback.")
+        return None, "Gemini is enabled, but AI_API_KEY is missing. Configure it in backend/.env; using catalogue-based recommendations."
     instruction = (
-        "Extract shopping requirements as JSON only. Keys: category (one of Laptops, Smartphones, "
-        "Headphones, Keyboards, Monitors, Accessories or null), max_budget_inr (number or null), "
-        "minimum_ram_gb (number or null), keywords (array of short strings). Do not recommend or invent products. "
-        "Use only explicit user requirements and conversation context."
+        "Extract only explicitly stated shopping requirements. Do not recommend products or invent product facts. "
+        "Use category from the supplied schema, budget in INR, minimum RAM in GB, and concise search keywords. "
+        "Set unknown values to null and keywords to an empty array."
     )
     try:
-        with httpx.Client(timeout=12) as client:
-            if provider == "openai":
-                response = client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.ai_api_key}"},
-                    json={
-                        "model": settings.ai_model,
-                        "response_format": {"type": "json_object"},
-                        "messages": [
-                            {"role": "system", "content": instruction},
-                            {"role": "user", "content": message[-5000:]},
-                        ],
-                    },
-                )
-                response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
-            else:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.ai_model}:generateContent"
-                response = client.post(
-                    url,
-                    headers={"x-goog-api-key": settings.ai_api_key},
-                    json={
-                        "system_instruction": {"parts": [{"text": instruction}]},
-                        "contents": [{"parts": [{"text": message[-5000:]}]}],
-                        "generationConfig": {"responseMimeType": "application/json"},
-                    },
-                )
-                response.raise_for_status()
-                content = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-        parsed = json.loads(content)
-        return parsed if isinstance(parsed, dict) else None
-    except (httpx.HTTPError, KeyError, ValueError, TypeError) as error:
-        logger.warning("AI requirements extraction failed; using catalogue fallback (%s).", type(error).__name__)
-        return None
+        with genai.Client(
+            api_key=settings.ai_api_key,
+            http_options=types.HttpOptions(timeout=12_000),
+        ) as client:
+            response = client.interactions.create(
+                model=settings.ai_model,
+                input=f"{instruction}\n\nCustomer request:\n{message[-5000:]}",
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": ShoppingRequirements.model_json_schema(),
+                },
+            )
+        requirements = ShoppingRequirements.model_validate_json(response.output_text)
+        return requirements.model_dump(), None
+    except genai_errors.APIError as error:
+        code = error.code
+        logger.warning("Gemini API request failed with HTTP %s; using deterministic catalogue fallback.", code)
+        if code in {401, 403}:
+            warning = "Gemini authentication failed. Verify AI_API_KEY and API access; using catalogue-based recommendations."
+        elif code == 400:
+            warning = "Gemini rejected the request. Check the structured output and model configuration; using catalogue-based recommendations."
+        elif code == 404:
+            warning = "The configured Gemini model is unavailable. Check AI_MODEL and model access; using catalogue-based recommendations."
+        elif code == 429:
+            warning = "Gemini rate limit or quota was reached; using catalogue-based recommendations."
+        else:
+            warning = f"Gemini returned HTTP {code}; using catalogue-based recommendations."
+        return None, warning
+    except httpx2.HTTPError as error:
+        logger.warning("Gemini transport request failed (%s); using deterministic catalogue fallback.", type(error).__name__)
+        return None, "Could not connect to Gemini. Check network connectivity; using catalogue-based recommendations."
+    except (ValidationError, ValueError, TypeError, AttributeError) as error:
+        logger.warning("Gemini returned unusable structured requirements (%s); using deterministic catalogue fallback.", type(error).__name__)
+        return None, "Gemini returned an invalid requirements response; using catalogue-based recommendations."
 
 
 def recommend(db: Session, message: str, prior_ids: list[str] | None = None) -> dict:
     category = extract_category(message)
     budget = parse_budget(message)
     minimum_ram = None
-    ai_requirements = extract_with_ai(message)
+    ai_requirements, ai_warning = extract_with_ai(message)
     if ai_requirements:
         allowed = {product.category for product in db.query(Product.category).distinct().all()}
         if ai_requirements.get("category") in allowed:
@@ -170,7 +201,10 @@ def recommend(db: Session, message: str, prior_ids: list[str] | None = None) -> 
     else:
         response = f"I found {len(ranked)} in-stock option{'s' if len(ranked) != 1 else ''} in the catalogue. Here are the closest matches based on your request."
     mode = "llm_requirements+database" if ai_requirements else "database_fallback"
-    return {"requirements": requirements, "recommendations": ranked, "response": response, "mode": mode}
+    result = {"requirements": requirements, "recommendations": ranked, "response": response, "mode": mode}
+    if ai_warning:
+        result["ai_warning"] = ai_warning
+    return result
 
 
 def get_cart(db: Session, session_id: str) -> dict:

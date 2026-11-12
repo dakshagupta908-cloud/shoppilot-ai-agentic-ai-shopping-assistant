@@ -16,6 +16,7 @@ export default function Assistant() {
     text: string;
     recommendations?: AgentResponse["recommendations"];
     requirements?: AgentResponse["requirements"];
+    aiWarning?: string;
   };
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -31,7 +32,13 @@ export default function Assistant() {
     try {
       const priorContext = next.slice(-6).map((m) => `${m.role === "user" ? "Customer" : "Agent"}: ${m.text}`).join("\n");
       const { data } = await api.post<AgentResponse>("/api/agent/chat", { message: priorContext });
-      setMessages((current) => [...current, { role: "assistant", text: data.response, recommendations: data.recommendations, requirements: data.requirements }]);
+      setMessages((current) => [...current, {
+        role: "assistant",
+        text: data.response,
+        recommendations: data.recommendations,
+        requirements: data.requirements,
+        aiWarning: data.ai_warning,
+      }]);
     } catch (e) {
       setError(errorMessage(e));
       setMessages((current) => [...current, { role: "assistant", text: "I couldn't reach the product catalogue just now. Please try again in a moment.", recommendations: [] }]);
@@ -49,7 +56,7 @@ export default function Assistant() {
       <div className="chat-topbar"><div><strong>Shopping assistant</strong><small>Product discovery · Demo ratings shown</small></div><button className="icon-button" title="Clear conversation" onClick={() => { setMessages([]); setError(""); }}><RotateCcw size={16} /></button></div>
       <div className="chat-messages">
         {messages.length === 0 && <div className="chat-welcome"><div className="welcome-icon"><Sparkles size={22} /></div><p className="eyebrow">A BETTER WAY TO SHOP</p><h2>What are we looking for?</h2><p>Share your budget, what you’ll use it for, or the features you care about. We’ll find real products to match.</p><div className="welcome-prompts">{prompts.slice(0, 3).map((p) => <button key={p} onClick={() => send(p)}>{p}<ArrowRight size={14} /></button>)}</div></div>}
-        {messages.map((message, index) => <div className={`message-row ${message.role}`} key={index}><div className="message-avatar">{message.role === "user" ? <UserRound size={15} /> : <Bot size={16} />}</div><div className="message-content"><div className="bubble">{message.text}</div>{message.requirements?.max_budget && <span className="intent-chip">Budget · up to ₹{Number(message.requirements.max_budget).toLocaleString("en-IN")}</span>}{Boolean(message.recommendations?.length) && <div className="recommendation-grid">{message.recommendations?.map(({ product, explanation }) => <div className="rec-wrap" key={product.id}><ProductCard product={product} onAdd={add} compact /><p className="recommendation-reason"><Sparkles size={13} /> {explanation}</p></div>)}</div>}</div></div>)}
+        {messages.map((message, index) => <div className={`message-row ${message.role}`} key={index}><div className="message-avatar">{message.role === "user" ? <UserRound size={15} /> : <Bot size={16} />}</div><div className="message-content"><div className="bubble">{message.text}</div>{message.aiWarning && <div className="inline-error" role="alert">{message.aiWarning}</div>}{message.requirements?.max_budget && <span className="intent-chip">Budget · up to ₹{Number(message.requirements.max_budget).toLocaleString("en-IN")}</span>}{Boolean(message.recommendations?.length) && <div className="recommendation-grid">{message.recommendations?.map(({ product, explanation }) => <div className="rec-wrap" key={product.id}><ProductCard product={product} onAdd={add} compact /><p className="recommendation-reason"><Sparkles size={13} /> {explanation}</p></div>)}</div>}</div></div>)}
         {busy && <div className="message-row assistant"><div className="message-avatar"><Bot size={16} /></div><div className="typing-bubble"><LoaderCircle size={16} className="spin" /> Searching the catalogue and weighing your options…</div></div>}
         {error && <div className="inline-error">{error}</div>}
         <div ref={bottomRef} />

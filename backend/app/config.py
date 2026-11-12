@@ -5,9 +5,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     database_url: str = "sqlite:///./shoppilot.db"
     frontend_url: str = "http://localhost:5173"
-    ai_provider: str = ""
+    ai_provider: str = "gemini"
     ai_api_key: str = ""
-    ai_model: str = "gpt-4o-mini"
+    ai_model: str = "gemini-3.1-pro-preview"
     paypal_client_id: str = ""
     paypal_client_secret: str = ""
     paypal_base_url: str = "https://api-m.sandbox.paypal.com"

@@ -1,8 +1,12 @@
 import uuid
+from types import SimpleNamespace
 
 import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
+from google import genai
+from google.genai.errors import APIError
 from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -12,13 +16,16 @@ from app.config import settings
 from app.database import Base, get_db
 from app.main import app
 from app.seed import seed_products
+from app.services import parse_budget
 
 client = TestClient(app)
 SESSION = {"X-Session-ID": "test-shopper-01"}
 
 
 @pytest.fixture(autouse=True)
-def isolated_database():
+def isolated_database(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "")
+    monkeypatch.setattr(settings, "ai_api_key", "")
     test_engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -41,6 +48,20 @@ def isolated_database():
     app.dependency_overrides.pop(get_db, None)
     Base.metadata.drop_all(bind=test_engine)
     test_engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("Laptop under ₹60k", 60000),
+        ("Laptop under ₹60,000", 60000),
+        ("Laptop under Rs. 60 thousand", 60000),
+        ("Laptop budget 60k", 60000),
+        ("Budget ₹45,000; prefer under ₹60k", 60000),
+    ],
+)
+def test_parse_budget_supports_currency_and_thousand_suffix(message, expected):
+    assert parse_budget(message) == expected
 
 
 def test_health_and_seeded_catalogue():
@@ -111,24 +132,29 @@ def test_guest_cart_requires_session_and_orders_are_scoped():
     assert client.get("/api/orders", headers={"X-Session-ID": "someone-else"}).json()["orders"] == []
 
 
-def test_ai_requirements_extraction_uses_provider_and_keeps_catalogue_grounded(monkeypatch):
-    monkeypatch.setattr(settings, "ai_provider", "openai")
-    monkeypatch.setattr(settings, "ai_api_key", "test-only-key")
-    monkeypatch.setattr(settings, "ai_model", "gpt-4o-mini")
+def test_gemini_sdk_extracts_structured_requirements_and_keeps_catalogue_grounded(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "gemini")
+    monkeypatch.setattr(settings, "ai_api_key", "test-only-gemini-key")
+    monkeypatch.setattr(settings, "ai_model", "gemini-3.1-pro-preview")
+    output = (
+        '{"category":"Laptops","max_budget_inr":60000,'
+        '"minimum_ram_gb":16,"keywords":["programming"]}'
+    )
 
-    class FakeResponse:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"choices": [{"message": {"content": (
-                '{"category":"Laptops","max_budget_inr":60000,'
-                '"minimum_ram_gb":16,"keywords":["programming"]}'
-            )}}]}
+    class FakeInteractions:
+        def create(self, **kwargs):
+            assert kwargs["model"] == "gemini-3.1-pro-preview"
+            assert kwargs["response_format"]["type"] == "text"
+            assert kwargs["response_format"]["mime_type"] == "application/json"
+            assert "Laptops" in kwargs["response_format"]["schema"]["properties"]["category"]["anyOf"][0]["enum"]
+            assert "Customer request:" in kwargs["input"]
+            return SimpleNamespace(output_text=output)
 
     class FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
+        def __init__(self, *, api_key, http_options):
+            assert api_key == "test-only-gemini-key"
+            assert http_options.timeout == 12_000
+            self.interactions = FakeInteractions()
 
         def __enter__(self):
             return self
@@ -136,22 +162,136 @@ def test_ai_requirements_extraction_uses_provider_and_keeps_catalogue_grounded(m
         def __exit__(self, *args):
             return None
 
-        def post(self, url, **kwargs):
-            assert url == "https://api.openai.com/v1/chat/completions"
-            assert kwargs["headers"]["Authorization"] == "Bearer test-only-key"
-            return FakeResponse()
-
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-    result = client.post("/api/agent/recommend", json={"message": "I need something portable for programming"})
-    assert result.status_code == 200
-    data = result.json()
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    response = client.post(
+        "/api/agent/recommend",
+        json={"message": "I need a laptop under ₹60k with 16GB RAM for programming"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "llm_requirements+database"
     assert data["requirements"]["category"] == "Laptops"
     assert data["requirements"]["max_budget"] == 60000
     assert data["requirements"]["minimum_ram_gb"] == 16
-    assert data["mode"] == "llm_requirements+database"
     assert data["recommendations"]
     assert all(item["product"]["category"] == "Laptops" for item in data["recommendations"])
     assert all(item["product"]["price"] <= 60000 for item in data["recommendations"])
+    assert "test-only-gemini-key" not in response.text
+
+
+def test_missing_gemini_key_reports_warning_and_uses_deterministic_fallback(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "gemini")
+    monkeypatch.setattr(settings, "ai_api_key", "")
+    monkeypatch.setattr(genai, "Client", lambda **kwargs: pytest.fail("Gemini must not be called without a key"))
+
+    response = client.post(
+        "/api/agent/recommend",
+        json={"message": "Laptop under ₹60k with 16GB RAM"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "database_fallback"
+    assert data["requirements"]["max_budget"] == 60000
+    assert "AI_API_KEY is missing" in data["ai_warning"]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "warning_fragment"),
+    [
+        (401, "authentication failed"),
+        (404, "model is unavailable"),
+        (429, "quota"),
+    ],
+)
+def test_gemini_api_errors_are_sanitized_and_fall_back(monkeypatch, status_code, warning_fragment):
+    monkeypatch.setattr(settings, "ai_provider", "gemini")
+    monkeypatch.setattr(settings, "ai_api_key", "test-only-gemini-key")
+
+    class FakeInteractions:
+        def create(self, **kwargs):
+            raise APIError(status_code, {"error": {"message": "private provider response"}})
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.interactions = FakeInteractions()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    response = client.post(
+        "/api/agent/recommend",
+        json={"message": "Laptop under ₹60k with 16GB RAM"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "database_fallback"
+    assert data["requirements"]["max_budget"] == 60000
+    assert warning_fragment in data["ai_warning"].lower()
+    assert "private provider response" not in response.text
+
+
+def test_gemini_invalid_structured_output_reports_warning_and_falls_back(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "gemini")
+    monkeypatch.setattr(settings, "ai_api_key", "test-only-gemini-key")
+
+    class FakeInteractions:
+        def create(self, **kwargs):
+            return SimpleNamespace(output_text='{"category":"Unknown category"}')
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.interactions = FakeInteractions()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    response = client.post(
+        "/api/agent/recommend",
+        json={"message": "Laptop under ₹60k"},
+    )
+    assert response.status_code == 200
+    assert response.json()["mode"] == "database_fallback"
+    assert "invalid requirements response" in response.json()["ai_warning"]
+    assert response.json()["requirements"]["max_budget"] == 60000
+
+
+def test_gemini_transport_error_reports_warning_and_falls_back(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "gemini")
+    monkeypatch.setattr(settings, "ai_api_key", "test-only-gemini-key")
+    request = httpx2.Request("POST", "https://generativelanguage.googleapis.com")
+
+    class FakeInteractions:
+        def create(self, **kwargs):
+            raise httpx2.ConnectError("mocked network failure", request=request)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.interactions = FakeInteractions()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    response = client.post(
+        "/api/agent/recommend",
+        json={"message": "Laptop under ₹60k"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "database_fallback"
+    assert "Could not connect to Gemini" in data["ai_warning"]
+    assert "mocked network failure" not in response.text
 
 
 def test_paypal_live_host_is_rejected():
